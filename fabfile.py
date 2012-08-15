@@ -24,12 +24,15 @@ from fabric.contrib.console import confirm as fab_confirm
 from os import listdir as os_listdir
 from os import mkdir as os_mkdir
 from os import symlink as os_symlink
+from os import stat as os_stat
+from os import remove as os_remove
 from os import path as os_path
 from os import walk as os_walk
 from shutil import copyfile
 from string import Template
 from sys import exit as sys_exit
 from time import localtime
+from time import time
 import re
 import glob
 
@@ -71,24 +74,33 @@ retentions = 5s:14d,1m:20d,10m:90d
 
 @task
 def patch_os(ag='apt-get'):
+    apt_upd = None
+
     with settings(
         show('running',
              'stdout',
              'stderr'),
         warn_only=True, always_use_pty='false'):
-        apt_upd = fab_local('apt-get update',capture=True)
 
-        if apt_upd.failed:
-            fab_puts("{0}".format('Aptitude failed to complete updating.'), show_prefix=False)
+        ## Check if package cache is older than one day, if not
+        ## there is no reason to update it again.
+        if time() - os_stat('/var/cache/apt/pkgcache.bin').st_mtime < 86400:
+            fab_puts("Caches are still fresh, will not update.",show_prefix=False)
+        else:
+            apt_upd = fab_local('apt-get update',capture=True)
 
-        if apt_upd.succeeded:
-            ## If we successfully updated, let's actually upgrade packages
-            apt_upgr = fab_local("{0} {1}".format(ag,'dist-upgrade --assume-yes'),
-                                 capture=True)
+            if apt_upd.failed:
+                fab_puts("{0}".format('Aptitude failed to completely update cache.'), show_prefix=False)
+
+            if apt_upd.succeeded:
+                ## If we successfully updated, let's actually upgrade packages
+                apt_upgr = fab_local("{0} {1}".format(ag,'dist-upgrade --assume-yes'),
+                                 capture=False)
 
 @task
 def install_blueprint(ag='apt-get'):
     devs_repo = '/etc/apt/sources.list.d/devstructure.list'
+
     with settings(
         show('running',
              'stdout',
@@ -108,6 +120,8 @@ def install_blueprint(ag='apt-get'):
          'http://packages.devstructure.com/keyring.gpg'
         ))
 
+        ## Have to update here to install Blueprint, otherwise would
+        ## save time not updating the cache.
         apt_upd = fab_local('apt-get update',capture=True)
         if apt_upd.succeeded:
             fab_local("{0} {1}".format(ag,'install --no-install-recommends --assume-yes blueprint'))
@@ -115,6 +129,7 @@ def install_blueprint(ag='apt-get'):
 @task
 def create_snapshot():
     message = '\"Snapshot before graphite and its dependencies\"'
+
     with settings(
         show('running',
              'stdout',
@@ -132,7 +147,7 @@ def create_snapshot():
 
 
 @task
-def install_deps(ag='apt-get --dry-run'):
+def install_deps(ag='apt-get'):
     reqs = ['apache2', 'libapache2-mod-wsgi',
     'libapache2-mod-python', 'memcached', 'python-dev', 'python-cairo-dev',
     'python-django', 'python-ldap', 'python-memcache', 'python-pysqlite2',
@@ -144,12 +159,18 @@ def install_deps(ag='apt-get --dry-run'):
              'stderr'),
         warn_only=True, always_use_pty='false'):
 
-        fab_local("{0} install --no-install-recommends {1}".format(ag," ".join(reqs)))
-        fab_local('pip install django-tagging')
+        a = fab_local("{0} install --no-install-recommends --assume-yes {1}".format(ag," ".join(reqs)))
+        b = fab_local('pip install django-tagging')
 
-        if inst_reqs.succeeded:
+        if a.succeeded and b.succeeded:
             fab_puts("Installed Prerequisites for Graphite.", show_prefix=False)
+        else:
+            if a.failed:
+                print a.stderr
+            if b.failed:
+                print b.stderr
 
+            fab_abort("Failed to Install Pre-requisites, cannot continue.", show_prefix=False)
 
 @task
 def install_rest(pip_cmd='pip install'):
@@ -200,21 +221,38 @@ def configure():
         ## Write template into the new config file
         ## /etc/apache2/sites-available/default-graphite
 
-        open(apache_dst_conf,'wt').write(
-            make_apache_conf.substitute(port=80,wsgi_sockd='/etc/httpd/wsgi/')
-        )
+        try:
+            open(apache_dst_conf,'wt').write(
+                make_apache_conf.substitute(port=80,wsgi_sockd='/etc/httpd/wsgi/')
+            )
+            fab_puts("Wrote apache config for Graphite WebApp.",show_prefix=False)
 
-        open(stor_sch_conf,'at').write(stor_base_templ)
+        except IOError as e:
+            fab_abort("Error {0} Failed to open file {1}".format(e.errno,e.filename))
+
+        try:
+            open(stor_sch_conf,'at').write(stor_base_templ)
+            fab_puts("Updated storage schema config with brickstor elements.",show_prefix=False)
+
+        except IOError as e:
+            fab_abort("Error {0} Failed to open file {1}".format(e.errno,e.filename))
+
+        try:
+            os_remove('/etc/apache2/sites-enabled/000-default')
+        except OSError as e:
+            print "Warning: {0} {1}".format(e.filename,e.args)
 
         ## Create necessary directories for Apache
         for dir in ['/etc/httpd','/etc/httpd/wsgi']:
             try:
                 os_mkdir(dir,0755)
+                fab_puts("Created directory: {0}".format(dir),show_prefix=False)
             except OSError as e:
                 print "Warning: {0} {1}".format(e.filename,e.args)
 
         try:
             os_symlink(apache_dst_conf, apache_enab_conf)
+            fab_puts("Created symbolic link for {0}".format(apache_dst_conf),show_prefix=False)
 
         except OSError as e:
             print "Warning: {0} {1}".format(e.filename,e.args)
@@ -232,3 +270,20 @@ def configure():
 
         ## Reload Apache config after all the changes
         fab_local("/etc/init.d/apache2 reload")
+
+@task
+def startup():
+
+    with settings(
+        show('running',
+             'stdout',
+             'stderr'),
+        warn_only=True, always_use_pty='false'):
+
+        start_graph = fab_local('/opt/graphite/bin/carbon-cache.py start',capture=True)
+
+        if start_graph.succeeded:
+            fab_puts("Successfully Started Graphite. Check your browser!",show_prefix=False)
+        else:
+            fab_puts("Failed to Start Graphite. \
+            Please check Graphite and Apache2 logs.",show_prefix=False)
